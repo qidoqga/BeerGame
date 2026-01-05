@@ -1,31 +1,57 @@
 /**
- * BeerBot API endpoint (/api/decision)
+ * BeerBot API endpoint (/api/decision) - Improved controller
+ * Algorithm: BullwhipBreakerPlus (v1.1.0)
  *
- * Deployment target: Vercel Functions (no framework)
- *
- * Deterministic, stateless: uses only request JSON (incl. weeks history).
- *
- * Algorithm: "BullwhipBreaker" (v1.0.0)
- * - Demand forecasting via simple exponential smoothing (SES)
- * - Inventory + supply-line (pipeline) adjustment (Sterman-style anchoring/adjustment)
- * - Mild order smoothing to damp oscillations
+ * Key ideas:
+ * - Order-up-to policy using Inventory Position (IL + pipeline)
+ * - Adaptive exponential smoothing forecast
+ * - Upstream demand clipping in blackbox mode to damp bullwhip
+ * - Mild order smoothing + rate limiting
  */
 
 const META = {
   student_email: "jolepl@taltech.ee",
-  algorithm_name: "BullwhipBreaker",
-  version: "v1.0.0",
+  algorithm_name: "BullwhipBreakerPlus",
+  version: "v1.1.0",
   supports: { blackbox: true, glassbox: true },
 };
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
 
-// Controller parameters tuned for stability; upstream reacts more slowly.
+// Parameters: tuned for stability (upstream reacts more slowly)
 const PARAMS = {
-  retailer:   { alphaF: 0.35, Ti: 2.8, Tp: 5.5, betaO: 0.35, safetyWeeks: 1.1, maxOrder: 250 },
-  wholesaler: { alphaF: 0.28, Ti: 3.3, Tp: 6.5, betaO: 0.30, safetyWeeks: 1.2, maxOrder: 250 },
-  distributor:{ alphaF: 0.24, Ti: 3.8, Tp: 7.5, betaO: 0.28, safetyWeeks: 1.25, maxOrder: 250 },
-  factory:    { alphaF: 0.20, Ti: 4.4, Tp: 8.5, betaO: 0.25, safetyWeeks: 1.3, maxOrder: 300 },
+  retailer: {
+    L: 4,
+    alphaBase: 0.55, alphaMin: 0.20, alphaMax: 0.85, alphaK: 0.35,
+    smooth: 0.20,
+    safetyWeeks: 1.10, z: 1.0,
+    clipWindow: 0, clipK: 0,
+    maxOrder: 350
+  },
+  wholesaler: {
+    L: 4,
+    alphaBase: 0.40, alphaMin: 0.15, alphaMax: 0.75, alphaK: 0.25,
+    smooth: 0.30,
+    safetyWeeks: 1.15, z: 1.1,
+    clipWindow: 6, clipK: 2.3,
+    maxOrder: 350
+  },
+  distributor: {
+    L: 4,
+    alphaBase: 0.33, alphaMin: 0.12, alphaMax: 0.70, alphaK: 0.22,
+    smooth: 0.35,
+    safetyWeeks: 1.20, z: 1.15,
+    clipWindow: 6, clipK: 2.2,
+    maxOrder: 380
+  },
+  factory: {
+    L: 4,
+    alphaBase: 0.28, alphaMin: 0.10, alphaMax: 0.65, alphaK: 0.20,
+    smooth: 0.40,
+    safetyWeeks: 1.25, z: 1.2,
+    clipWindow: 6, clipK: 2.1,
+    maxOrder: 420
+  },
 };
 
 function clamp(x, lo, hi) {
@@ -50,18 +76,61 @@ function stdev(arr) {
   return Math.sqrt(v);
 }
 
-function ses(series, alpha) {
-  // Simple exponential smoothing, initialized with first observation.
+function median(arr) {
+  if (!arr.length) return 0;
+  const a = [...arr].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function mad(arr) {
+  if (!arr.length) return 0;
+  const m = median(arr);
+  const dev = arr.map(x => Math.abs(x - m));
+  return median(dev);
+}
+
+function clipSeriesRolling(series, window = 6, k = 2.2) {
+  // Deterministic robust clipping to avoid reacting to spikes
+  const out = [];
+  for (let i = 0; i < series.length; i++) {
+    const x = series[i];
+    const start = Math.max(0, i - window);
+    const hist = out.slice(start, i); // use already-clipped history
+    if (hist.length < 3) {
+      out.push(x);
+      continue;
+    }
+    const m = median(hist);
+    const mdev = mad(hist);
+    // convert MAD to sigma-ish scale if possible
+    const scale = mdev > 0 ? 1.4826 * mdev : stdev(hist);
+    const lo = m - k * scale;
+    const hi = m + k * scale;
+    out.push(clamp(x, lo, hi));
+  }
+  return out;
+}
+
+function adaptiveSES(series, p) {
+  // Adaptive exponential smoothing: alpha increases when error is large
   if (!series.length) return 0;
   let f = series[0];
   for (let i = 1; i < series.length; i++) {
-    f = alpha * series[i] + (1 - alpha) * f;
+    const x = series[i];
+    const err = x - f;
+    const scale = Math.abs(f) + 1; // avoid division by 0
+    const alpha = clamp(
+        p.alphaBase + p.alphaK * (Math.abs(err) / scale),
+        p.alphaMin,
+        p.alphaMax
+    );
+    f = f + alpha * err;
   }
   return f;
 }
 
 function safeGet(obj, path, fallback = 0) {
-  // path: array of keys
   let cur = obj;
   for (const k of path) {
     if (cur && Object.prototype.hasOwnProperty.call(cur, k)) cur = cur[k];
@@ -71,19 +140,13 @@ function safeGet(obj, path, fallback = 0) {
 }
 
 async function readJson(req) {
-  // If Vercel already parsed it
   if (req.body && typeof req.body === "object") return req.body;
 
-  // Otherwise read the stream
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
 
   const raw = Buffer.concat(chunks).toString("utf8").trim();
-
-  // Handle Windows CMD sending quotes literally sometimes
-  const cleaned =
-      (raw.startsWith("'") && raw.endsWith("'")) ? raw.slice(1, -1) : raw;
-
+  const cleaned = (raw.startsWith("'") && raw.endsWith("'")) ? raw.slice(1, -1) : raw;
   if (!cleaned) return {};
   return JSON.parse(cleaned);
 }
@@ -106,20 +169,16 @@ function roleHistory(weeks, role) {
   return { inv, back, incOrd, arrShip, myOrders };
 }
 
-function estimatePipeline({ arrShip, myOrders }, forecast, defaultLead = 4) {
-  // Deterministic proxy for outstanding orders (supply line).
-  // Start with a reasonable initial pipeline (equilibrium assumption).
-  let pipe = Math.max(0, Math.round(defaultLead * forecast));
+function estimatePipeline(arrShip, myOrders, forecast, L) {
+  // Outstanding orders proxy: start from equilibrium L*forecast, then update.
+  let pipe = Math.max(0, Math.round(L * forecast));
   for (let i = 0; i < arrShip.length; i++) {
-    const received = arrShip[i];
-    const ordered = myOrders[i] ?? 0;
-    pipe = Math.max(0, pipe - received) + ordered;
+    pipe = Math.max(0, pipe - arrShip[i]) + (myOrders[i] ?? 0);
   }
   return pipe;
 }
 
 function chooseSharedDemandSeries(weeks) {
-  // For glassbox: use retailer incoming_orders as end-customer demand proxy.
   const series = [];
   for (const w of weeks) {
     series.push(toNonNegInt(safeGet(w, ["roles", "retailer", "incoming_orders"], 0)));
@@ -127,65 +186,63 @@ function chooseSharedDemandSeries(weeks) {
   return series;
 }
 
-function computeOrderForRole({
-  role,
-  weeks,
-  mode,
-  sharedDemandSeries,
-}) {
+function computeOrderForRole({ role, weeks, mode, sharedDemandSeries }) {
   const p = PARAMS[role];
   const h = roleHistory(weeks, role);
 
   // Demand signal
-  const demandSeries = (mode === "glassbox") ? sharedDemandSeries : h.incOrd;
-  const forecast = ses(demandSeries, p.alphaF);
+  let demandSeries = (mode === "glassbox") ? sharedDemandSeries : h.incOrd;
 
-  // Variability estimate (recent window)
+  // Clip upstream demand in BLACKBOX to avoid reacting to spikes caused by downstream bullwhip
+  if (mode === "blackbox" && p.clipWindow && role !== "retailer") {
+    demandSeries = clipSeriesRolling(demandSeries, p.clipWindow, p.clipK);
+  }
+
+  const forecast = adaptiveSES(demandSeries, p);
+
+  // recent variability
   const recent = demandSeries.slice(Math.max(0, demandSeries.length - 8));
   const sigma = stdev(recent);
 
-  // Current state from last week snapshot
   const invNow = h.inv.at(-1) ?? 0;
   const backNow = h.back.at(-1) ?? 0;
-  const IL = invNow - backNow; // inventory level (can be negative)
+  const IL = invNow - backNow;
 
-  // Pipeline estimate uses only this role's shipments + its own order history
-  const pipe = estimatePipeline(h, forecast, 4);
+  const pipe = estimatePipeline(h.arrShip, h.myOrders, forecast, p.L);
 
-  // Infer an "effective" lead time from pipeline / forecast (bounded)
-  const effLead = clamp(
-    Math.round(pipe / Math.max(1, forecast)),
-    1,
-    8
+  // Inventory position (key for base-stock policy)
+  const IP = IL + pipe;
+
+  // Safety stock (weeks of demand + variability buffer)
+  const safety = Math.max(
+      0,
+      Math.round(p.safetyWeeks * forecast + p.z * sigma * Math.sqrt(p.L + 1))
   );
 
-  // Targets
-  const safetyStock = Math.max(0, Math.round(p.safetyWeeks * forecast + 1.5 * sigma));
-  const desiredIL = safetyStock;                 // desired on-hand minus backlog
-  const desiredPipe = Math.round(forecast * effLead);
+  // Target inventory position for order-up-to policy
+  const targetIP = Math.round((p.L + 1) * forecast + safety);
 
-  // Sterman-style anchoring & adjustment + expected demand
-  const orderRaw =
-    forecast +
-    (desiredIL - IL) / p.Ti +
-    (desiredPipe - pipe) / p.Tp;
+  // Raw order suggestion
+  const raw = Math.max(0, targetIP - IP);
 
-  // Mild order smoothing (reduces amplification)
+  // Mild smoothing to reduce oscillation
   const prevOrder = h.myOrders.at(-1) ?? 0;
-  const orderSmoothed = (1 - p.betaO) * prevOrder + p.betaO * orderRaw;
+  let order = (1 - p.smooth) * raw + p.smooth * prevOrder;
 
-  // Final safeguards
-  const capped = clamp(orderSmoothed, 0, p.maxOrder);
-  return toNonNegInt(capped);
+  // Rate limit: allow faster ramp-up than ramp-down (helps avoid whiplash)
+  const maxUp = Math.max(10, Math.round((backNow > 0 ? 6 : 4) * Math.max(1, forecast)));
+  const maxDown = Math.max(10, Math.round(2.5 * Math.max(1, forecast)));
+  order = clamp(order, prevOrder - maxDown, prevOrder + maxUp);
+
+  // Final caps
+  order = clamp(order, 0, p.maxOrder);
+  return toNonNegInt(order);
 }
 
 function computeOrders(body) {
   const mode = (body && body.mode === "glassbox") ? "glassbox" : "blackbox";
   const weeks = Array.isArray(body?.weeks) ? body.weeks : [];
-  if (!weeks.length) {
-    // Fallback (spec says simulator will default to 10 if we error; we avoid error)
-    return { retailer: 10, wholesaler: 10, distributor: 10, factory: 10 };
-  }
+  if (!weeks.length) return { retailer: 10, wholesaler: 10, distributor: 10, factory: 10 };
 
   const sharedDemandSeries = chooseSharedDemandSeries(weeks);
 
@@ -214,7 +271,7 @@ module.exports = async (req, res) => {
                 message: "BeerBot ready",
                 uses_llm: false,
                 student_comment:
-                    "SES forecast + inventory/pipeline adjustment + order smoothing (deterministic)",
+                    "Order-up-to (inventory position) + adaptive SES + upstream demand clipping + smoothing",
               })
           );
     }
@@ -225,7 +282,7 @@ module.exports = async (req, res) => {
         .status(200)
         .setHeader("Content-Type", "application/json")
         .end(JSON.stringify({ orders }));
-  } catch (e) {
+  } catch {
     return res
         .status(200)
         .setHeader("Content-Type", "application/json")
