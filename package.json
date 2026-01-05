@@ -1,0 +1,10 @@
+{
+  "name": "beerbot-bullwhipbreaker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deterministic Beer Distribution Game bot (BeerBot API v1.2)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
