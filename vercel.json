@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/decision.js": {
-      "runtime": "nodejs18.x"
-    }
-  }
-}
