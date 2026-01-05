@@ -70,17 +70,22 @@ function safeGet(obj, path, fallback = 0) {
   return typeof cur === "number" && Number.isFinite(cur) ? cur : fallback;
 }
 
-function parseJsonBody(req) {
-  // Vercel may give req.body as object, string, or Buffer.
-  const b = req.body;
-  if (!b) return {};
-  if (typeof b === "object" && !Buffer.isBuffer(b)) return b;
-  try {
-    const s = Buffer.isBuffer(b) ? b.toString("utf8") : String(b);
-    return JSON.parse(s);
-  } catch {
-    return {};
-  }
+async function readJson(req) {
+  // If Vercel already parsed it
+  if (req.body && typeof req.body === "object") return req.body;
+
+  // Otherwise read the stream
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+
+  // Handle Windows CMD sending quotes literally sometimes
+  const cleaned =
+      (raw.startsWith("'") && raw.endsWith("'")) ? raw.slice(1, -1) : raw;
+
+  if (!cleaned) return {};
+  return JSON.parse(cleaned);
 }
 
 function roleHistory(weeks, role) {
@@ -194,7 +199,7 @@ function computeOrders(body) {
 module.exports = async (req, res) => {
   // Always return 200 with JSON to satisfy simulator robustness expectations.
   try {
-    const body = parseJsonBody(req);
+    const body = parseJson(req);
 
     if (body && body.handshake === true) {
       return res
