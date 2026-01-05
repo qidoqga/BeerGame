@@ -5,6 +5,6 @@
   "description": "Deterministic Beer Distribution Game bot (BeerBot API v1.2)",
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
   }
 }
