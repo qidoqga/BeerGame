@@ -197,46 +197,43 @@ function computeOrders(body) {
 }
 
 module.exports = async (req, res) => {
-  // Always return 200 with JSON to satisfy simulator robustness expectations.
   try {
-    const body = parseJson(req);
+    const body = await readJson(req);
 
     if (body && body.handshake === true) {
       return res
-        .status(200)
-        .setHeader("Content-Type", "application/json")
-        .end(
-          JSON.stringify({
-            ok: true,
-            student_email: META.student_email,
-            algorithm_name: META.algorithm_name,
-            version: META.version,
-            supports: META.supports,
-            message: "BeerBot ready",
-            // Optional documentation fields
-            uses_llm: false,
-            student_comment:
-              "SES forecast + inventory/pipeline adjustment + order smoothing (deterministic)",
-          })
-        );
+          .status(200)
+          .setHeader("Content-Type", "application/json")
+          .end(
+              JSON.stringify({
+                ok: true,
+                student_email: META.student_email,
+                algorithm_name: META.algorithm_name,
+                version: META.version,
+                supports: META.supports,
+                message: "BeerBot ready",
+                uses_llm: false,
+                student_comment:
+                    "SES forecast + inventory/pipeline adjustment + order smoothing (deterministic)",
+              })
+          );
     }
 
     const orders = computeOrders(body);
 
     return res
-      .status(200)
-      .setHeader("Content-Type", "application/json")
-      .end(JSON.stringify({ orders }));
+        .status(200)
+        .setHeader("Content-Type", "application/json")
+        .end(JSON.stringify({ orders }));
   } catch (e) {
-    // Fail-safe: valid JSON with default orders
     return res
-      .status(200)
-      .setHeader("Content-Type", "application/json")
-      .end(
-        JSON.stringify({
-          orders: { retailer: 10, wholesaler: 10, distributor: 10, factory: 10 },
-          error: "handled_exception",
-        })
-      );
+        .status(200)
+        .setHeader("Content-Type", "application/json")
+        .end(
+            JSON.stringify({
+              orders: { retailer: 10, wholesaler: 10, distributor: 10, factory: 10 },
+              error: "handled_exception",
+            })
+        );
   }
 };
