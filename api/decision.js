@@ -12,7 +12,7 @@
  */
 
 const META = {
-  student_email: "firstname.lastname@taltech.ee", // <-- CHANGE THIS
+  student_email: "jolepl@taltech.ee",
   algorithm_name: "BullwhipBreaker",
   version: "v1.0.0",
   supports: { blackbox: true, glassbox: true },
